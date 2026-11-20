@@ -10,6 +10,8 @@
   6. 并发争料：两个独立连接抢最后库存，恰好一个成功
   7. 质量换代：旧预览被拒、重新规划、旧确认保持来源
   8. 最大规模（12 批 / M=300 / 4 成分）性能与全枚举核对
+  9. 盲样比对轮次：盲码冻结、中位数资格与更正重评、双报告证据化发布、
+     同机构拒绝、原产品复读与文件库重开持久化
 """
 
 from __future__ import annotations
@@ -17,12 +19,14 @@ from __future__ import annotations
 import threading
 from fractions import Fraction
 
-from blend.catalog import QualityCatalog
+from blend.blinding import QUALIFIED, BlindingService
+from blend.catalog import GOV_DUAL_LAB_BLIND_REPORT, QualityCatalog
 from blend.model import (
     ComponentConstraint,
     ConflictError,
     Order,
     StalePreviewError,
+    ValidationError,
 )
 from blend.planner import Planner, brute_force_best, evaluate_usage, explain_plan
 from blend.warehouse import Warehouse
@@ -337,6 +341,139 @@ def demo_max_scale_and_brute_force() -> None:
     print("两者完全一致，最优性得到独立枚举确认。")
 
 
+# ---------------------------------------------------------------- 场景 9
+
+
+def demo_blind_comparison_and_evidence_publish() -> None:
+    section("场景 9｜盲样比对轮次与可采信质检报告（完整证据链 + 重开持久化）")
+    import tempfile
+    from pathlib import Path
+
+    tmp = tempfile.mkdtemp()
+    pt_path = str(Path(tmp) / "pt.db")
+    cat_path = str(Path(tmp) / "cat.db")
+
+    svc = BlindingService(pt_path)
+    for oid in ("O-A", "O-B", "O-C", "O-D"):
+        svc.register_organization(oid, name=f"运营机构 {oid}")
+    labs = ["LAB1", "LAB2", "LAB3", "LAB4"]
+    for lab, oid in zip(labs, ("O-A", "O-B", "O-C", "O-D")):
+        svc.register_lab(lab, oid, name=f"实验室 {lab}")
+    svc.create_round("PT-2026-01", "cX", F(1), note="cX 合成试样首轮")
+    codes = svc.issue_blind_codes("PT-2026-01", labs)
+
+    print("① 冻结盲码（开放期映射不进入任何只读视图）：")
+    for lab in labs:
+        print(f"   {lab} -> 盲码 {codes[lab]}")
+
+    for lab, v in zip(labs, (1, 3, 5, 9)):
+        svc.submit_reading(codes[lab], v)
+    print("   盲码视图示例（LAB2 只见本实验室回执）:",
+          [(r.reading_id, str(r.value), r.superseded)
+           for r in svc.receipts(codes["LAB2"])])
+
+    v1 = svc.close_round("PT-2026-01")
+    print("\n② 首次关闭 v%d：逐人中位数资格（容差=1）" % v1)
+    for q in svc.get_closure(v1).qualifications:
+        print(f"   {q.lab_id}: {q.status:9s} 读数={q.reading} "
+              f"参照={q.reference} 差={q.abs_diff} 来源读数#{q.reading_id}")
+    assert svc.get_closure(v1).qualification("LAB3").status == "FAILED"
+
+    # 正式更正：LAB2 3 -> 5，重开后再次关闭
+    svc.reopen_round("PT-2026-01")
+    print("\n③ 重开放正式更正（LAB2: 3 -> 5），开放试报不产生资格；")
+    print("   重开期间当前可采信版本仍是 v%d" % svc.current_closure_version("PT-2026-01"))
+    svc.submit_reading(codes["LAB2"], 5)
+    v2 = svc.close_round("PT-2026-01", note="LAB2 正式更正后重评")
+    print(f"   再次关闭生成新版本 v{v2}（接续 v{svc.get_closure(v2).supersedes_version}），"
+          "资格变化：")
+    s1 = {q.lab_id: q.status for q in svc.get_closure(v1).qualifications}
+    s2 = {q.lab_id: q.status for q in svc.get_closure(v2).qualifications}
+    for lab in labs:
+        flag = "  <-- 变化" if s1[lab] != s2[lab] else ""
+        print(f"   {lab}: {s1[lab]} -> {s2[lab]}{flag}")
+    assert s2["LAB2"] == QUALIFIED and s2["LAB3"] == QUALIFIED
+    assert svc.get_closure(v1).qualification("LAB3").status == "FAILED"  # 旧版保留
+
+    # ---------------- 目录侧证据化发布 ----------------
+    cat = QualityCatalog(cat_path, svc)
+    cat.replace_lots([
+        make_lot("L1", 100, {"cX": ("0", "1"), "cO": ("1/10", "1/5")}),
+        make_lot("L2", 80, {"cX": ("0", "1"), "cO": ("1/4", "1/3")}),
+    ], note="手工基线修订")
+    cat.enable_controlled_component("cX", note="cX 改由外部双实验室治理")
+
+    print("\n④ 受控成分启用后，原手工改写入口被封锁：")
+    try:
+        cat.replace_lots([
+            make_lot("L1", 100, {"cX": ("1/2", "1/2"), "cO": ("1/10", "1/5")}),
+            make_lot("L2", 80, {"cX": ("0", "1"), "cO": ("1/4", "1/3")}),
+        ])
+    except ValidationError as exc:
+        print("   拒绝：", exc)
+
+    # 题面区间：[1/5,2/5] 与 [3/10,1/2]
+    cat.register_lab_report("RP-A", "LAB2", "SMP-NEW", "L1", "cX", F(1, 5), F(2, 5))
+    cat.register_lab_report("RP-B", "LAB3", "SMP-NEW", "L1", "cX", F(3, 10), F(1, 2))
+    pub = cat.publish_external_component(
+        "L1", "cX", GOV_DUAL_LAB_BLIND_REPORT, ["RP-A", "RP-B"], v2,
+        note="cX 首次外部受控发布",
+    )
+    print(f"\n⑤ 双报告精确交集发布成功 -> 修订 rev{pub.rev}，"
+          f"区间 [{pub.lo}, {pub.hi}]（即 [3/10, 2/5]）")
+    print("   冻结证据：")
+    for r in pub.reports:
+        print(f"   - 报告 {r.report_id} 实验室 {r.lab_id}（机构 {r.org_id}）"
+              f" 区间 [{r.lo}, {r.hi}]")
+    for q in pub.qualifications:
+        print(f"   - 资格 {q.lab_id}（机构 {q.org_id}）{q.status} "
+              f"盲码 {q.blind_code} 读数#{q.reading_id}={q.reading} "
+              f"参照={q.reference} 差={q.abs_diff} 容差={q.tolerance}")
+
+    # 同机构拒绝：归并后再发一次新样本
+    svc.merge_organizations("O-B", "O-C")
+    cat.register_lab_report("RP-C", "LAB2", "SMP-X", "L1", "cX", F(1, 5), F(2, 5))
+    cat.register_lab_report("RP-D", "LAB3", "SMP-X", "L1", "cX", F(3, 10), F(1, 2))
+    print("\n⑥ 机构归并后同机构发布拒绝：")
+    try:
+        cat.publish_external_component(
+            "L1", "cX", GOV_DUAL_LAB_BLIND_REPORT, ["RP-C", "RP-D"], v2)
+    except ValidationError as exc:
+        print("   拒绝：", exc)
+    frozen = cat.get_publication(pub.pub_id)
+    print("   已发布证据快照不受归并影响，机构仍为:",
+          sorted({q.org_id for q in frozen.qualifications}))
+
+    print("\n⑦ 原目录产品复读：旧修订 rev%d 上的质量产品保持来源区间" % pub.rev)
+    old_product = cat.product({"L1": 10, "L2": 0}, rev=pub.rev)
+    print("   rev%d cX 分数界 =" % pub.rev, old_product.fraction_bounds["cX"],
+          "来源", old_product.source)
+    # 非受控手工成分在所有修订上继续可读
+    print("   手工成分 cO 区间（L1）:", cat.get_lot("L1").intervals["cO"])
+
+    # ---------------- 重开持久化 ----------------
+    svc.close()
+    cat.close()
+    svc2 = BlindingService(pt_path)
+    cat2 = QualityCatalog(cat_path, svc2)
+    print("\n⑧ 文件库重开后持久化核对：")
+    print("   比对轮次:", [r["round_id"] + "/" + r["state"] for r in svc2.list_rounds()])
+    print("   关闭版本:", [c["version"] for c in svc2.list_closures("PT-2026-01")])
+    print("   目录当前 cX（L1）:", cat2.get_lot("L1").intervals["cX"])
+    ev = cat2.get_publication_by_rev(pub.rev)
+    print("   发布证据盲码可单独核对:",
+          [(q.lab_id, q.blind_code, q.status) for q in ev.qualifications])
+    try:
+        cat2.replace_lots([
+            make_lot("L1", 100, {"cX": ("0", "1/2"), "cO": ("1/10", "1/5")}),
+            make_lot("L2", 80, {"cX": ("0", "1"), "cO": ("1/4", "1/3")}),
+        ])
+    except ValidationError as exc:
+        print("   重开后防绕开关卡仍生效：", exc)
+    cat2.close()
+    svc2.close()
+
+
 def main() -> None:
     demo_catalog_product()
     demo_midpoint_vs_robust()
@@ -346,6 +483,7 @@ def main() -> None:
     demo_concurrent_race()
     demo_quality_generation()
     demo_max_scale_and_brute_force()
+    demo_blind_comparison_and_evidence_publish()
     print("\n全部演示场景完成。")
 
 
